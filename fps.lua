@@ -1,17 +1,20 @@
 --[[
     ╔══════════════════════════════════════════════════════════════╗
-    ║         ULTRA LAG FIX v3 — MAX FPS EDITION                  ║
-    ║   FPS UNLOCK + 30 Optimizations + Gộp 1 nút duy nhất        ║
+    ║      ULTRA LAG FIX v4 — SMART RENDER DISTANCE                ║
+    ║   Không xóa vĩnh viễn · Tự render lại khi lại gần            ║
     ╚══════════════════════════════════════════════════════════════╝
     
-    QUAN TRỌNG: 60 FPS là giới hạn VSync — script này sẽ UNLOCK lên 240+
+    CƠ CHẾ:
+        ✦ Part xa → ẩn (Transparency=1) + tắt collide
+        ✦ Đến gần → hiện lại (restore transparency gốc)
+        ✦ Effect/Decal → giữ trạng thái, tự restore
+        ✦ FPS unlock 240+ (nếu executor hỗ trợ)
+        ✦ Không xóa gì → không lo mất map
     
-    CÁCH DÙNG:
-        - Chạy script → tự động tối ưu mức Balanced + unlock FPS
-        - Cần thêm FPS → bấm "MAX FPS MODE" (1 nút duy nhất)
-        - Cần chơi bình thường → bấm "Restore"
-    
-    GỘP LẠI: Không cần bật từng cái — preset làm hết
+    DÙNG CHO:
+        ✓ Map rộng (1000+ studs)
+        ✓ Game survival (99 Nights, Dead Rails...)
+        ✓ Máy yếu nhưng muốn thấy map khi lại gần
 ]]
 
 local Players = game:GetService("Players")
@@ -20,7 +23,7 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local CoreGui = game:GetService("CoreGui")
 local StarterGui = game:GetService("StarterGui")
-local SoundService = game:GetService("SoundService")
+local TweenService = game:GetService("TweenService")
 
 local LP = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
@@ -35,34 +38,52 @@ if not ok or type(Lib) ~= "table" then Lib = nil end
 -- ════════════════════════════════════════════════════════════════
 local State = {
     Enabled = true,
-    Preset = "Balanced",
+    -- Khoảng cách
+    HIDE_DIST = 500,       -- ẩn part xa hơn X studs
+    RESTORE_DIST = 400,    -- hiện lại khi gần hơn Y studs (hysteresis)
+    EFFECT_DIST = 200,     -- tắt effect xa hơn Z studs
+    PHYSICS_DIST = 150,    -- tắt physics part xa hơn
+    
+    -- Tracking
+    HiddenParts = {},      -- [part] = {transparency, cancollide, canquery, cantouch}
+    DisabledEffects = {},  -- [obj] = true
+    
+    -- FPS
     FPS = 0,
-    OriginalFPS = 0,
+    StartTime = tick(),
+    
+    -- Backup
     Backup = {},
-    Stats = {count = 0},
+    
+    -- Stats
+    Stats = {hidden = 0, restored = 0, effects_off = 0, effects_on = 0},
 }
 
-local function log(...) print("[UltraFix]", ...) end
+local function log(...) print("[SmartRender]", ...) end
+local function notify(t, txt, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = t, Text = txt, Duration = dur or 3,
+        })
+    end)
+end
+
 local function getMyPos()
-    local h = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local c = LP.Character
+    local h = c and c:FindFirstChild("HumanoidRootPart")
     return h and h.Position or Vector3.new(0, 0, 0)
 end
 
 -- ════════════════════════════════════════════════════════════════
---  FPS UNLOCK (BƯỚC QUAN TRỌNG NHẤT)
+--  FPS UNLOCK
 -- ════════════════════════════════════════════════════════════════
 local function unlockFPS()
-    -- Mặc định Roblox cap ở 60 (VSync). Các executor cho phép override.
-    if setfpscap then
-        pcall(function() setfpscap(9999) end)
-        log("setfpscap(9999)")
-    end
+    if setfpscap then pcall(function() setfpscap(9999) end) end
     if setfflag then
         pcall(function()
             setfflag("TaskSchedulerTargetFps", "9999")
             setfflag("DFIntTaskSchedulerTargetFps", "9999")
         end)
-        log("setfflag TaskScheduler")
     end
     pcall(function()
         if settings and settings().Rendering then
@@ -74,14 +95,11 @@ end
 -- ════════════════════════════════════════════════════════════════
 --  BACKUP
 -- ════════════════════════════════════════════════════════════════
-local function backup()
+local function backupAll()
     State.Backup.Lighting = {
         GlobalShadows = Lighting.GlobalShadows,
         FogEnd = Lighting.FogEnd,
         FogStart = Lighting.FogStart,
-        Brightness = Lighting.Brightness,
-        Ambient = Lighting.Ambient,
-        OutdoorAmbient = Lighting.OutdoorAmbient,
     }
     pcall(function()
         State.Backup.Terrain = {
@@ -91,165 +109,216 @@ local function backup()
             WaterTransparency = Workspace.Terrain.WaterTransparency,
         }
     end)
-    pcall(function()
-        State.Backup.Reverb = SoundService.AmbientReverb
-    end)
 end
 
 -- ════════════════════════════════════════════════════════════════
---  OPTIMIZERS (GỘP LẠI — 1 HÀM LÀM HẾT)
+--  HIDE PART (lưu trạng thái gốc)
 -- ════════════════════════════════════════════════════════════════
-local function optimizeAll(opts)
-    opts = opts or {}
+local function hidePart(part)
+    if State.HiddenParts[part] then return end
+    -- Không ẩn part quan trọng
+    if part:IsA("Terrain") then return end
+    if part:IsDescendantOf(LP.Character) then return end
+    if part.Anchored and part.Size.Magnitude > 500 then return end  -- base lớn
+    
+    -- Lưu trạng thái gốc
+    State.HiddenParts[part] = {
+        Transparency = part.Transparency,
+        CanCollide = part.CanCollide,
+        CanQuery = part.CanQuery,
+        CanTouch = part.CanTouch,
+        CastShadow = part.CastShadow,
+    }
+    
+    -- Ẩn
+    pcall(function()
+        part.Transparency = 1
+        part.CanCollide = false
+        part.CanQuery = false
+        part.CanTouch = false
+        part.CastShadow = false
+    end)
+    
+    State.Stats.hidden = State.Stats.hidden + 1
+end
+
+local function showPart(part)
+    local orig = State.HiddenParts[part]
+    if not orig then return end
+    
+    pcall(function()
+        if part.Parent then
+            part.Transparency = orig.Transparency
+            part.CanCollide = orig.CanCollide
+            part.CanQuery = orig.CanQuery
+            part.CanTouch = orig.CanTouch
+            part.CastShadow = orig.CastShadow
+        end
+    end)
+    
+    State.HiddenParts[part] = nil
+    State.Stats.restored = State.Stats.restored + 1
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  HIDE EFFECTS (particle, fire, light...)
+-- ════════════════════════════════════════════════════════════════
+local function hideEffect(obj)
+    if State.DisabledEffects[obj] then return end
+    State.DisabledEffects[obj] = {
+        Enabled = obj.Enabled,
+    }
+    pcall(function() obj.Enabled = false end)
+    State.Stats.effects_off = State.Stats.effects_off + 1
+end
+
+local function showEffect(obj)
+    local orig = State.DisabledEffects[obj]
+    if not orig then return end
+    if obj.Parent then
+        pcall(function() obj.Enabled = orig.Enabled end)
+    end
+    State.DisabledEffects[obj] = nil
+    State.Stats.effects_on = State.Stats.effects_on + 1
+end
+
+-- ════════════════════════════════════════════════════════════════
+--  MAIN LOOP — Chạy mỗi 0.5s
+-- ════════════════════════════════════════════════════════════════
+local function renderLoop()
+    if not State.Enabled then return end
+    
     local myPos = getMyPos()
-    local farDist = opts.farDist or 800
-    local physDist = opts.physDist or 300
-    local counts = {particle = 0, light = 0, decal = 0, part = 0, sound = 0, billboard = 0, anim = 0}
-
-    -- 1. Kill particles + effects + LIGHTS
-    for _, o in ipairs(Workspace:GetDescendants()) do
-        pcall(function()
-            if o:IsA("ParticleEmitter") then
-                o.Enabled = false; o.Rate = 0; counts.particle = counts.particle + 1
-            elseif o:IsA("Fire") or o:IsA("Smoke") or o:IsA("Sparkles") then
-                o.Enabled = false; counts.particle = counts.particle + 1
-            elseif o:IsA("Trail") or o:IsA("Beam") then
-                o.Enabled = false; counts.particle = counts.particle + 1
-            elseif o:IsA("PointLight") or o:IsA("SpotLight") or o:IsA("SurfaceLight") then
-                o.Enabled = false; counts.light = counts.light + 1
-            elseif o:IsA("Decal") or o:IsA("Texture") then
-                o.Transparency = 1; counts.decal = counts.decal + 1
-            elseif o:IsA("BillboardGui") then
-                local adornee = o.Adornee or o.Parent
-                if adornee and adornee:IsA("BasePart") and (adornee.Position - myPos).Magnitude > 80 then
-                    o.Enabled = false; counts.billboard = counts.billboard + 1
+    local hideDist2 = State.HIDE_DIST * State.HIDE_DIST
+    local restoreDist2 = State.RESTORE_DIST * State.RESTORE_DIST
+    local effectDist2 = State.EFFECT_DIST * State.EFFECT_DIST
+    local physicsDist2 = State.PHYSICS_DIST * State.PHYSICS_DIST
+    
+    -- ==== 1. PART XA ====
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") and not obj:IsA("Terrain") then
+            local isHidden = State.HiddenParts[obj] ~= nil
+            local dist2 = (obj.Position - myPos).Magnitude ^ 2
+            
+            if isHidden then
+                -- Đang ẩn, check xem gần lại chưa
+                if dist2 < restoreDist2 then
+                    showPart(obj)
                 end
-            elseif o:IsA("Highlight") or o:IsA("SelectionBox") then
-                o.Enabled = false
-            end
-        end)
-    end
-
-    -- 2. Kill sounds
-    for _, o in ipairs(Workspace:GetDescendants()) do
-        if o:IsA("Sound") and o.Playing and o.Volume < 3 then
-            pcall(function() o.Volume = 0; o.Playing = false; counts.sound = counts.sound + 1 end)
-        end
-    end
-
-    -- 3. Kill other players' animations
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LP and p.Character then
-            local anim = p.Character:FindFirstChildOfClass("Animator")
-            if anim then
-                pcall(function()
-                    for _, t in ipairs(anim:GetPlayingAnimationTracks()) do t:Stop(0) end
-                end)
-                counts.anim = counts.anim + 1
+            else
+                -- Đang hiện, check xem xa quá chưa
+                if dist2 > hideDist2 then
+                    hidePart(obj)
+                end
             end
         end
     end
-
-    -- 4. Far parts (hide) + Physics far (disable touch/query)
-    for _, o in ipairs(Workspace:GetDescendants()) do
-        if o:IsA("BasePart") and not o:IsA("Terrain") then
-            local d = (o.Position - myPos).Magnitude
-            if d > farDist then
-                pcall(function()
-                    o.Transparency = 1
-                    o.CanCollide = false
-                    counts.part = counts.part + 1
-                end)
-            elseif d > physDist and not o.Anchored then
-                pcall(function()
-                    o.CanTouch = false
-                    o.CanQuery = false
-                end)
+    
+    -- ==== 2. EFFECT XA ====
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        local isEffect = obj:IsA("ParticleEmitter") or obj:IsA("Fire")
+            or obj:IsA("Smoke") or obj:IsA("Sparkles")
+            or obj:IsA("Trail") or obj:IsA("Beam")
+            or obj:IsA("PointLight") or obj:IsA("SpotLight")
+            or obj:IsA("SurfaceLight") or obj:IsA("Decal")
+            or obj:IsA("Texture")
+        
+        if isEffect then
+            -- Tìm parent BasePart để lấy vị trí
+            local pos = nil
+            if obj:IsA("BasePart") then
+                pos = obj.Position
+            else
+                local p = obj.Parent
+                if p and p:IsA("BasePart") then
+                    pos = p.Position
+                elseif p and p.Parent and p.Parent:IsA("BasePart") then
+                    pos = p.Parent.Position
+                end
+            end
+            
+            if pos then
+                local isDisabled = State.DisabledEffects[obj] ~= nil
+                local dist2 = (pos - myPos).Magnitude ^ 2
+                
+                if isDisabled then
+                    if dist2 < restoreDist2 then
+                        showEffect(obj)
+                    end
+                else
+                    if dist2 > effectDist2 then
+                        hideEffect(obj)
+                    end
+                end
             end
         end
     end
+    
+    -- ==== 3. BILLBOARD XA ====
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BillboardGui") and obj.Enabled then
+            local adornee = obj.Adornee or obj.Parent
+            if adornee and adornee:IsA("BasePart") then
+                local dist2 = (adornee.Position - myPos).Magnitude ^ 2
+                if dist2 > effectDist2 and not State.DisabledEffects[obj] then
+                    State.DisabledEffects[obj] = {Enabled = true}
+                    obj.Enabled = false
+                end
+            end
+        end
+    end
+end
 
-    -- 5. Lighting
+-- ════════════════════════════════════════════════════════════════
+--  LIGHTING OPTIMIZE (tĩnh)
+-- ════════════════════════════════════════════════════════════════
+local function applyLighting()
     pcall(function()
         Lighting.GlobalShadows = false
-        Lighting.FogEnd = 400
-        Lighting.FogStart = 100
+        Lighting.FogEnd = 600
+        Lighting.FogStart = 200
         Lighting.EnvironmentDiffuseScale = 0
         Lighting.EnvironmentSpecularScale = 0
-        for _, e in ipairs(Lighting:GetChildren()) do
-            if e:IsA("PostEffect") or e:IsA("Atmosphere") or e:IsA("Clouds") then
-                e.Enabled = false
-            end
+    end)
+    -- Tắt post effects (không restore vì ít ảnh hưởng)
+    for _, obj in ipairs(Lighting:GetChildren()) do
+        if obj:IsA("PostEffect") or obj:IsA("Atmosphere") or obj:IsA("Clouds") then
+            pcall(function() obj.Enabled = false end)
         end
-    end)
-
-    -- 6. Terrain
-    pcall(function()
-        Workspace.Terrain.WaterWaveSize = 0
-        Workspace.Terrain.WaterWaveSpeed = 0
-        Workspace.Terrain.WaterReflectance = 0
-        Workspace.Terrain.WaterTransparency = 1
-    end)
-
-    -- 7. Quality
+    end
     pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
     pcall(function() settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level01 end)
-
-    -- 8. Sound ambient off
-    pcall(function() SoundService.AmbientReverb = Enum.ReverbType.NoReverb end)
-    pcall(function() SoundService.RespectFilteringEnabled = true end)
-
-    -- 9. FOV nhẹ tăng (giúp giảm culling = ít render hơn)
-    pcall(function() Camera.FieldOfView = 90 end)
-
-    State.Stats = counts
-    log("Tối ưu:", counts.particle, "particle,", counts.light, "light,", counts.part, "part")
 end
 
 -- ════════════════════════════════════════════════════════════════
---  PRESETS (GỘP — 3 MỨC)
+--  RESTORE TOÀN BỘ (khi tắt)
 -- ════════════════════════════════════════════════════════════════
-local function setPreset(name)
-    State.Preset = name
-    if name == "Light" then
-        optimizeAll({farDist = 2000, physDist = 800})
-    elseif name == "Balanced" then
-        optimizeAll({farDist = 800, physDist = 300})
-    elseif name == "Extreme" then
-        optimizeAll({farDist = 300, physDist = 100})
-        pcall(function()
-            Lighting.FogEnd = 200
-            Lighting.FogStart = 50
-        end)
+local function restoreAll()
+    log("Restoring all hidden parts...")
+    for part, _ in pairs(State.HiddenParts) do
+        showPart(part)
     end
-    if Lib and Lib.Banner then
-        Lib.Banner("Ultra Fix", "Preset: " .. name, Color3.fromRGB(110, 145, 235), 2, "⚡")
+    for effect, _ in pairs(State.DisabledEffects) do
+        showEffect(effect)
     end
-end
-
--- ════════════════════════════════════════════════════════════════
---  RESTORE
--- ════════════════════════════════════════════════════════════════
-local function restore()
+    -- Lighting
     pcall(function()
         for k, v in pairs(State.Backup.Lighting or {}) do Lighting[k] = v end
         for k, v in pairs(State.Backup.Terrain or {}) do Workspace.Terrain[k] = v end
-        if State.Backup.Reverb then SoundService.AmbientReverb = State.Backup.Reverb end
-        Camera.FieldOfView = 70
     end)
-    if Lib and Lib.Banner then
-        Lib.Banner("Restore", "Đã khôi phục gốc", Color3.fromRGB(225, 180, 110), 3, "↻")
-    end
+    notify("Smart Render", "Đã restore toàn bộ map", 3)
+    log("Restored!")
 end
 
 -- ════════════════════════════════════════════════════════════════
---  AUTO CLEANUP
+--  AUTO RENDER LOOP (Heartbeat, giới hạn 2Hz)
 -- ════════════════════════════════════════════════════════════════
+local renderConn
 task.spawn(function()
     while true do
-        task.wait(15)
+        task.wait(0.5)
         if State.Enabled then
-            optimizeAll({farDist = 800, physDist = 300})
+            pcall(renderLoop)
         end
     end
 end)
@@ -260,19 +329,18 @@ end)
 local fpsGui, fpsLabel
 pcall(function()
     fpsGui = Instance.new("ScreenGui")
-    fpsGui.Name = "UltraFix_FPS"
+    fpsGui.Name = "SmartRender_FPS"
     fpsGui.ResetOnSpawn = false
     fpsGui.DisplayOrder = 10000
     fpsGui.Parent = CoreGui
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 130, 0, 36)
-    frame.Position = UDim2.new(1, -150, 0, 10)
+    frame.Size = UDim2.new(0, 140, 0, 38)
+    frame.Position = UDim2.new(1, -160, 0, 10)
     frame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
     frame.BackgroundTransparency = 0.1
     frame.BorderSizePixel = 0
     frame.Parent = fpsGui
-
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
     fpsLabel = Instance.new("TextLabel")
@@ -298,7 +366,7 @@ task.spawn(function()
                 local c = Color3.fromRGB(120, 195, 140)
                 if State.FPS < 30 then c = Color3.fromRGB(220, 115, 125)
                 elseif State.FPS < 60 then c = Color3.fromRGB(225, 180, 110) end
-                fpsLabel.Text = "FPS: " .. State.FPS .. " (max)"
+                fpsLabel.Text = "FPS: " .. State.FPS
                 fpsLabel.TextColor3 = c
             end
         end
@@ -306,82 +374,104 @@ task.spawn(function()
 end)
 
 -- ════════════════════════════════════════════════════════════════
---  UI (GỘP — CHỈ 1 NÚT CHÍNH)
+--  UI
 -- ════════════════════════════════════════════════════════════════
 if Lib then
-    backup()
+    backupAll()
     unlockFPS()
+    applyLighting()
 
     local Window = Lib:CreateWindow({
-        Name = "Ultra Lag Fix",
-        Subtitle = "Max FPS v3",
+        Name = "Smart Render",
+        Subtitle = "FPS Boost v4",
         Author = "Doeak",
-        Size = UDim2.new(0, 620, 0, 460),
+        Size = UDim2.new(0, 620, 0, 480),
     })
 
     local MainTab = Window:CreateTab("Main", "◈")
-    local AdvancedTab = Window:CreateTab("Advanced", "⚙")
+    local DistTab = Window:CreateTab("Distance", "⚙")
+    local InfoTab = Window:CreateTab("Info", "◉")
 
     -- ═══ MAIN ═══
-    MainTab:CreateSection("🚀 ONE-CLICK")
+    MainTab:CreateSection("🚀 FPS Unlock")
 
     MainTab:CreateButton({
-        Name = "🔥  MAX FPS MODE (chạy hết mọi thứ)",
+        Name = "⚡  Unlock FPS (bỏ giới hạn 60)",
         Callback = function()
             unlockFPS()
-            setPreset("Extreme")
+            Lib.Banner("FPS", "Đã unlock! Kiểm tra FPS góc phải.", Color3.fromRGB(120, 195, 140), 3, "⚡")
+        end,
+    })
+
+    MainTab:CreateSection("🎯 Smart Render Distance")
+
+    MainTab:CreateToggle({
+        Name = "BẬT tối ưu thông minh",
+        Flag = "Enabled",
+        CurrentValue = true,
+        Callback = function(v)
+            State.Enabled = v
             if Lib.Banner then
-                Lib.Banner("MAX FPS", "Đã tối ưu cực hạn + unlock FPS!", Color3.fromRGB(120, 195, 140), 3, "🔥")
+                Lib.Banner("Smart Render", v and "Đã BẬT" or "Đã TẮT",
+                    v and Color3.fromRGB(120, 195, 140) or Color3.fromRGB(220, 115, 125), 2,
+                    v and "●" or "○")
             end
         end,
     })
 
-    MainTab:CreateButton({
-        Name = "⚡  FPS UNLOCK (chỉ unlock giới hạn 60)",
-        Callback = function()
-            unlockFPS()
-            if Lib.Banner then
-                Lib.Banner("FPS Unlock", "Đã unlock! Test FPS trên màn hình.", Color3.fromRGB(120, 195, 140), 3, "⚡")
-            end
-        end,
-    })
-
-    MainTab:CreateButton({
-        Name = "↻  Restore (khôi phục gốc)",
-        Callback = restore,
-    })
-
-    MainTab:CreateSection("Preset (gộp)")
+    MainTab:CreateSection("Preset")
 
     MainTab:CreateButton({
         Name = "🌤  Light (giữ đồ họa đẹp)",
         Callback = function()
-            unlockFPS()
-            setPreset("Light")
+            State.HIDE_DIST = 1500
+            State.RESTORE_DIST = 1200
+            State.EFFECT_DIST = 800
+            State.PHYSICS_DIST = 500
+            State.Enabled = true
+            restoreAll()
+            Lib.Banner("Preset", "Light — render xa", Color3.fromRGB(120, 195, 140), 2, "◈")
         end,
     })
 
     MainTab:CreateButton({
         Name = "⛅  Balanced (khuyên dùng)",
         Callback = function()
-            unlockFPS()
-            setPreset("Balanced")
+            State.HIDE_DIST = 500
+            State.RESTORE_DIST = 400
+            State.EFFECT_DIST = 200
+            State.PHYSICS_DIST = 150
+            State.Enabled = true
+            Lib.Banner("Preset", "Balanced", Color3.fromRGB(110, 145, 235), 2, "◈")
         end,
     })
 
     MainTab:CreateButton({
-        Name = "🌪  Extreme (máy yếu nhất)",
+        Name = "🌪  Extreme (máy yếu cực)",
         Callback = function()
-            unlockFPS()
-            setPreset("Extreme")
+            State.HIDE_DIST = 250
+            State.RESTORE_DIST = 200
+            State.EFFECT_DIST = 100
+            State.PHYSICS_DIST = 80
+            State.Enabled = true
+            Lib.Banner("Preset", "Extreme", Color3.fromRGB(220, 115, 125), 2, "◈")
+        end,
+    })
+
+    MainTab:CreateSection("↻ Restore")
+
+    MainTab:CreateButton({
+        Name = "🔄  Khôi phục toàn bộ map",
+        Callback = function()
+            restoreAll()
         end,
     })
 
     MainTab:CreateSection("Trạng thái")
 
     local infoP = MainTab:CreateParagraph({
-        Title = "Live Info",
-        Content = "Đang đo...",
+        Title = "Live Stats",
+        Content = "Đang chạy...",
     })
 
     task.spawn(function()
@@ -391,91 +481,114 @@ if Lib then
                 if infoP and infoP.Set then
                     local s = State.Stats
                     infoP:Set(string.format(
-                        "FPS: %d | Preset: %s\nParticle tắt: %d | Light tắt: %d | Part ẩn: %d",
-                        State.FPS, State.Preset, s.particle or 0, s.light or 0, s.part or 0))
+                        "FPS: %d\nPart ẩn: %d | Part hiện: %d\nEffect tắt: %d | Effect bật: %d",
+                        State.FPS, s.hidden, s.restored, s.effects_off, s.effects_on))
                 end
             end)
         end
     end)
 
-    -- ═══ ADVANCED (tùy chỉnh chi tiết) ═══
-    AdvancedTab:CreateSection("Giới hạn khoảng cách (mặc định 800/300)")
+    -- ═══ DISTANCE ═══
+    DistTab:CreateSection("Khoảng cách tùy chỉnh")
 
-    AdvancedTab:CreateSlider({
-        Name = "Ẩn Part xa (studs)",
-        Min = 200, Max = 2000, Default = 800,
-        Callback = function(v)
-            _G._UltraFarDist = v
-        end,
+    DistTab:CreateSlider({
+        Name = "Ẩn Part khi xa hơn (studs)",
+        Min = 100, Max = 3000, Default = 500,
+        Callback = function(v) State.HIDE_DIST = v end,
     })
 
-    AdvancedTab:CreateSlider({
-        Name = "Tắt physics part xa (studs)",
-        Min = 100, Max = 1000, Default = 300,
-        Callback = function(v)
-            _G._UltraPhysDist = v
-        end,
+    DistTab:CreateSlider({
+        Name = "Hiện lại Part khi gần hơn (studs)",
+        Min = 50, Max = 2500, Default = 400,
+        Callback = function(v) State.RESTORE_DIST = v end,
     })
 
-    AdvancedTab:CreateButton({
-        Name = "Áp dụng khoảng cách mới",
+    DistTab:CreateSlider({
+        Name = "Tắt Effect khi xa hơn (studs)",
+        Min = 50, Max = 1500, Default = 200,
+        Callback = function(v) State.EFFECT_DIST = v end,
+    })
+
+    DistTab:CreateSlider({
+        Name = "Tắt Physics khi xa hơn (studs)",
+        Min = 50, Max = 1000, Default = 150,
+        Callback = function(v) State.PHYSICS_DIST = v end,
+    })
+
+    DistTab:CreateLabel("Gợi ý: RESTORE < HIDE để tránh giật (hysteresis)")
+
+    DistTab:CreateSection("Debug")
+
+    DistTab:CreateButton({
+        Name = "In stats ra Console",
         Callback = function()
-            optimizeAll({
-                farDist = _G._UltraFarDist or 800,
-                physDist = _G._UltraPhysDist or 300,
-            })
-            if Lib.Banner then
-                Lib.Banner("Apply", "Đã áp dụng khoảng cách mới", Color3.fromRGB(120, 195, 140), 2, "✓")
-            end
+            print("=== SMART RENDER STATS ===")
+            for k, v in pairs(State.Stats) do print("  " .. k .. ":", v) end
+            print("  HIDE_DIST:", State.HIDE_DIST)
+            print("  RESTORE_DIST:", State.RESTORE_DIST)
+            print("  Hidden parts còn lại:", #State.HiddenParts)
         end,
     })
 
-    AdvancedTab:CreateSection("Auto cleanup")
+    -- ═══ INFO ═══
+    InfoTab:CreateSection("ℹ️ Cách hoạt động")
 
-    AdvancedTab:CreateToggle({
-        Name = "Tự động dọn mỗi 15 giây",
-        CurrentValue = true,
-        Callback = function(v) State.Enabled = v end,
-    })
+    InfoTab:CreateLabel("• Part xa → ẩn (transparency=1)")
+    InfoTab:CreateLabel("• Lại gần → tự hiện lại")
+    InfoTab:CreateLabel("• Effect/Decal xa → tắt")
+    InfoTab:CreateLabel("• Lại gần → tự bật lại")
+    InfoTab:CreateLabel("• Không xóa gì → map còn nguyên")
 
-    AdvancedTab:CreateSection("Debug")
+    InfoTab:CreateSection("Điều kiện an toàn")
 
-    AdvancedTab:CreateButton({
-        Name = "In stats ra Console (F9)",
-        Callback = function()
-            local s = State.Stats
-            print("=== ULTRA FIX STATS ===")
-            for k, v in pairs(s) do print("  " .. k .. ":", v) end
-            print("  FPS:", State.FPS)
-        end,
-    })
+    InfoTab:CreateLabel("• Không ẩn Character của bạn")
+    InfoTab:CreateLabel("• Không ẩn Terrain")
+    InfoTab:CreateLabel("• Không ẩn Base lớn (anchored)")
+    InfoTab:CreateLabel("• Có thể Restore mọi lúc")
 
-    AdvancedTab:CreateSection("Thông tin")
+    InfoTab:CreateSection("FPS unlock")
 
-    AdvancedTab:CreateLabel("FPS unlock: setfpscap(9999)")
-    AdvancedTab:CreateLabel("Nếu vẫn 60 FPS → executor không hỗ trợ setfpscap")
-    AdvancedTab:CreateLabel("Thử executor khác (Solara, Wave, ...)")
+    InfoTab:CreateLabel("setfpscap: " .. type(setfpscap))
+    InfoTab:CreateLabel("setfflag: " .. type(setfflag))
+
+    InfoTab:CreateLabel("Nếu cả 2 nil → executor không unlock được")
 end
 
 -- ════════════════════════════════════════════════════════════════
---  RUN INITIAL
+--  AUTO CLEANUP + STARTUP
 -- ════════════════════════════════════════════════════════════════
-backup()
+backupAll()
 unlockFPS()
-setPreset("Balanced")
+applyLighting()
+
+-- Bật tối ưu mặc định
+State.Enabled = true
+
+notify("Smart Render v4", "Đã bật! Part xa tự ẩn, lại gần tự hiện.", 5)
+
+log("=== SMART RENDER v4 READY ===")
+log("HIDE_DIST:", State.HIDE_DIST, "| RESTORE_DIST:", State.RESTORE_DIST)
+log("Effect xa:", State.EFFECT_DIST, "| Physics xa:", State.PHYSICS_DIST)
+log("FPS counter: góc phải trên")
 
 -- ════════════════════════════════════════════════════════════════
 --  API NGOÀI
 -- ════════════════════════════════════════════════════════════════
-_G.UltraFix = {
-    Run = function() optimizeAll() end,
-    Max = function() unlockFPS(); setPreset("Extreme") end,
-    SetPreset = setPreset,
-    Restore = restore,
-    UnlockFPS = unlockFPS,
-    GetFPS = function() return State.FPS end,
+_G.SmartRender = {
+    Toggle = function()
+        State.Enabled = not State.Enabled
+        log("Enabled:", State.Enabled)
+    end,
+    Restore = restoreAll,
+    SetDistances = function(hide, restore, effect, physics)
+        if hide then State.HIDE_DIST = hide end
+        if restore then State.RESTORE_DIST = restore end
+        if effect then State.EFFECT_DIST = effect end
+        if physics then State.PHYSICS_DIST = physics end
+        log("Distances updated")
+    end,
     GetStats = function() return State.Stats end,
+    GetFPS = function() return State.FPS end,
 }
 
-log("Loaded. Bấm 'MAX FPS MODE' để bật cực hạn.")
-log("API: _G.UltraFix.Max() / .Run() / .Restore()")
+log("API: _G.SmartRender.Toggle() / .Restore() / .SetDistances(hide, restore, effect, physics)")
